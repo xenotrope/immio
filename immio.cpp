@@ -1,6 +1,6 @@
 /*
     Public domain.
-    20260314
+    20260327
 */
 
 #include <windows.h>
@@ -9,16 +9,19 @@
 
 #pragma comment(lib, "bcrypt.lib")
 
-#define ID_BTN_SELECT_ISO 101
-#define ID_BTN_VERIFY     102
+/* -- Control IDs ---------------------------------------------------------- */
+#define ID_BTN_SELECT_ISO  101
+#define ID_BTN_VERIFY      102
+
+/* -- Custom window message posted by the worker thread on completion ------
+   wParam : unused (0)
+   lParam : heap-allocated HashResult* � UI thread must free it            */
+#define WM_HASH_DONE  (WM_APP + 1)
 
 #define READ_CHUNK_SIZE (1024 * 1024)   /* 1 MB read buffer */
 
-HWND hBtnSelectISO, hBtnVerify;
-char g_selectedFile[MAX_PATH] = {0};
-
-/* ── Pre-approved ISO catalogue ─────────────────────────────────────────
-   Add or remove entries here.  Each row is { display_filename, sha256_hex }.
+/* -- Pre-approved ISO catalogue ------------------------------------------
+   Each row is { sha256_hex, display_filename }.
    Hashes must be 64 lowercase hex characters.                            */
 typedef struct { const char *sha256; const char *filename; } ISOEntry;
 
@@ -91,95 +94,124 @@ static const ISOEntry g_approvedISOs[] =
     { "40a9988cc6edd253bff9fcab422aec1b2c81ab3aa4d34b91b08277592c5fab28", "lmde-6-cinnamon-32bit.iso"},
     { "96963cac1ac2ad4ba38414e618adbcdf64a6faadc33ddf53889fa3dc74d59df4", "lmde-6-cinnamon-64bit.iso"},
     { "520b9de3e06871d69292f0e82a5979b62088ad83fdf4dce1d19100118a7033e4", "lmde-7-cinnamon-64bit.iso"},
-
 };
 
 static const int g_approvedCount =
     (int)(sizeof(g_approvedISOs) / sizeof(g_approvedISOs[0]));
 
-/*
- * ComputeSHA256 - reads the file at `path` in chunks and produces a
- * hex-encoded SHA-256 digest in `outHex` (must be at least 65 bytes).
- * Returns TRUE on success, FALSE on any error.
- */
-static BOOL ComputeSHA256(HWND hwnd, const char *path, char *outHex)
+/* -- Data passed TO the worker thread (heap-allocated, thread frees it) -- */
+typedef struct
+{
+    HWND hwnd;
+    char path[MAX_PATH];
+} HashThreadParams;
+
+/* -- Result posted BACK to the UI thread (heap-allocated, UI frees it) --- */
+typedef struct
+{
+    BOOL success;
+    char hexDigest[65];   /* 64 hex chars + '\0' */
+    char errorMsg[256];   /* set on failure       */
+} HashResult;
+
+/* -- Global UI handles ----------------------------------------------------- */
+static HWND hBtnSelectISO;
+static HWND hBtnVerify;
+static char g_selectedFile[MAX_PATH] = {0};
+
+/* ----------------------------------------------------------------------------
+   ComputeSHA256
+   Pure computation � no UI calls.  Fills outHex (>=65 bytes) on success.
+   Fills errorMsg (>=256 bytes) and returns FALSE on any failure.
+   ---------------------------------------------------------------------------- */
+static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
 {
     BOOL success = FALSE;
 
     BCRYPT_ALG_HANDLE  hAlg  = NULL;
     BCRYPT_HASH_HANDLE hHash = NULL;
-    PBYTE  pbHashObject      = NULL;
-    PBYTE  pbHash            = NULL;
-    PBYTE  pbBuffer          = NULL;
-    DWORD  cbHashObject      = 0;
-    DWORD cbHash             = 0;
-    DWORD cbData             = 0;
-    HANDLE hFile             = INVALID_HANDLE_VALUE;
+    PBYTE  pbHashObject = NULL;
+    PBYTE  pbHash       = NULL;
+    PBYTE  pbBuffer     = NULL;
+    DWORD  cbHashObject = 0, cbHash = 0, cbData = 0;
+    HANDLE hFile        = INVALID_HANDLE_VALUE;
 
-    /* ── Open the CNG SHA-256 provider ─────────────────────────────── */
+    /* -- Open the CNG SHA-256 provider ------------------------------------ */
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
             &hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
     {
-        MessageBox(hwnd, "Failed to open BCrypt SHA-256 provider.",
-                   "Error", MB_OK | MB_ICONERROR);
+        strncpy(errorMsg, "Failed to open BCrypt SHA-256 provider.", 255);
         goto cleanup;
     }
 
-    /* ── Allocate the internal hash object ──────────────────────────── */
+    /* -- Size and allocate the internal hash object ----------------------- */
     if (!BCRYPT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
             (PBYTE)&cbHashObject, sizeof(DWORD), &cbData, 0)))
+    {
+        strncpy(errorMsg, "Failed to query BCrypt object length.", 255);
         goto cleanup;
+    }
 
     pbHashObject = (PBYTE)HeapAlloc(GetProcessHeap(), 0, cbHashObject);
-    if (!pbHashObject) goto cleanup;
+    if (!pbHashObject) { strncpy(errorMsg, "Out of memory.", 255); goto cleanup; }
 
-    /* ── Allocate the output digest buffer ──────────────────────────── */
+    /* -- Size and allocate the output digest buffer ----------------------- */
     if (!BCRYPT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH,
             (PBYTE)&cbHash, sizeof(DWORD), &cbData, 0)))
+    {
+        strncpy(errorMsg, "Failed to query BCrypt hash length.", 255);
         goto cleanup;
+    }
 
     pbHash = (PBYTE)HeapAlloc(GetProcessHeap(), 0, cbHash);
-    if (!pbHash) goto cleanup;
+    if (!pbHash) { strncpy(errorMsg, "Out of memory.", 255); goto cleanup; }
 
-    /* ── Create the hash state ───────────────────────────────────────── */
+    /* -- Create the hash state --------------------------------------------- */
     if (!BCRYPT_SUCCESS(BCryptCreateHash(
             hAlg, &hHash, pbHashObject, cbHashObject, NULL, 0, 0)))
+    {
+        strncpy(errorMsg, "Failed to create BCrypt hash object.", 255);
         goto cleanup;
+    }
 
-    /* ── Open the file ───────────────────────────────────────────────── */
+    /* -- Open the file ----------------------------------------------------- */
     hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                         OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
     {
-        MessageBox(hwnd, "Could not open the selected file.",
-                   "Error", MB_OK | MB_ICONERROR);
+        strncpy(errorMsg, "Could not open the selected file.", 255);
         goto cleanup;
     }
 
-    /* ── Feed file data to the hash in 1 MB chunks ───────────────────── */
+    /* -- Feed file data to the hash in 1 MB chunks ------------------------ */
     pbBuffer = (PBYTE)HeapAlloc(GetProcessHeap(), 0, READ_CHUNK_SIZE);
-    if (!pbBuffer) goto cleanup;
+    if (!pbBuffer) { strncpy(errorMsg, "Out of memory.", 255); goto cleanup; }
 
     for (;;)
     {
         DWORD dwRead = 0;
         if (!ReadFile(hFile, pbBuffer, READ_CHUNK_SIZE, &dwRead, NULL))
         {
-            MessageBox(hwnd, "Error reading file during hashing.",
-                       "Error", MB_OK | MB_ICONERROR);
+            strncpy(errorMsg, "Error reading file during hashing.", 255);
             goto cleanup;
         }
         if (dwRead == 0) break;  /* EOF */
 
         if (!BCRYPT_SUCCESS(BCryptHashData(hHash, pbBuffer, dwRead, 0)))
+        {
+            strncpy(errorMsg, "BCryptHashData failed.", 255);
             goto cleanup;
+        }
     }
 
-    /* ── Finalise and retrieve digest ───────────────────────────────── */
+    /* -- Finalise the digest ----------------------------------------------- */
     if (!BCRYPT_SUCCESS(BCryptFinishHash(hHash, pbHash, cbHash, 0)))
+    {
+        strncpy(errorMsg, "BCryptFinishHash failed.", 255);
         goto cleanup;
+    }
 
-    /* ── Convert raw bytes to lowercase hex string ───────────────────── */
+    /* -- Convert raw bytes to lowercase hex ------------------------------- */
     for (DWORD i = 0; i < cbHash; i++)
         sprintf(outHex + i * 2, "%02x", pbHash[i]);
     outHex[cbHash * 2] = '\0';
@@ -187,20 +219,55 @@ static BOOL ComputeSHA256(HWND hwnd, const char *path, char *outHex)
     success = TRUE;
 
 cleanup:
-    if (pbBuffer)     HeapFree(GetProcessHeap(), 0, pbBuffer);
+    if (pbBuffer)                      HeapFree(GetProcessHeap(), 0, pbBuffer);
     if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-    if (hHash)        BCryptDestroyHash(hHash);
-    if (pbHashObject) HeapFree(GetProcessHeap(), 0, pbHashObject);
-    if (pbHash)       HeapFree(GetProcessHeap(), 0, pbHash);
-    if (hAlg)         BCryptCloseAlgorithmProvider(hAlg, 0);
+    if (hHash)                         BCryptDestroyHash(hHash);
+    if (pbHashObject)                  HeapFree(GetProcessHeap(), 0, pbHashObject);
+    if (pbHash)                        HeapFree(GetProcessHeap(), 0, pbHash);
+    if (hAlg)                          BCryptCloseAlgorithmProvider(hAlg, 0);
 
     return success;
 }
 
+/* ----------------------------------------------------------------------------
+   HashThreadProc  �  worker thread entry point
+   Runs entirely off the UI thread.  Allocates a HashResult on the heap,
+   fills it, then hands ownership to the UI thread via PostMessage.
+   ---------------------------------------------------------------------------- */
+static DWORD WINAPI HashThreadProc(LPVOID lpParam)
+{
+    HashThreadParams *params = (HashThreadParams *)lpParam;
+
+    HashResult *result = (HashResult *)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(HashResult));
+
+    if (!result)
+    {
+        /* Catastrophic allocation failure � re-enable the UI at minimum */
+        PostMessage(params->hwnd, WM_HASH_DONE, 0, (LPARAM)NULL);
+        HeapFree(GetProcessHeap(), 0, params);
+        return 1;
+    }
+
+    result->success = ComputeSHA256(params->path,
+                                    result->hexDigest,
+                                    result->errorMsg);
+
+    /* Transfer ownership of `result` to the UI thread */
+    PostMessage(params->hwnd, WM_HASH_DONE, 0, (LPARAM)result);
+
+    HeapFree(GetProcessHeap(), 0, params);
+    return 0;
+}
+
+/* ----------------------------------------------------------------------------
+   WndProc  �  runs exclusively on the UI thread
+   ---------------------------------------------------------------------------- */
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
+    /* -- Create child controls -------------------------------------------- */
     case WM_CREATE:
         hBtnSelectISO = CreateWindow(
             "BUTTON", "Select ISO",
@@ -217,6 +284,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             ((LPCREATESTRUCT)lParam)->hInstance, NULL);
         break;
 
+    /* -- Button clicks ---------------------------------------------------- */
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
@@ -246,32 +314,91 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (g_selectedFile[0] == '\0')
             {
                 MessageBox(hwnd,
-                           "No ISO file selected. Please click \"Select ISO\" first.",
+                           "No ISO file selected. "
+                           "Please click \"Select ISO\" first.",
                            "Verify", MB_OK | MB_ICONWARNING);
                 break;
             }
 
-            /* SHA-256 hex digest is 64 chars + null terminator */
-            char hexDigest[65] = {0};
-
-            /* Disable both buttons while hashing */
+            /* Disable controls immediately � re-enabled in WM_HASH_DONE */
             EnableWindow(hBtnSelectISO, FALSE);
             EnableWindow(hBtnVerify,    FALSE);
             SetWindowText(hBtnVerify, "Working...");
 
-            BOOL ok = ComputeSHA256(hwnd, g_selectedFile, hexDigest);
+            /* Heap-allocate params � HashThreadProc frees them */
+            HashThreadParams *params = (HashThreadParams *)HeapAlloc(
+                GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(HashThreadParams));
 
-            EnableWindow(hBtnSelectISO, TRUE);
-            EnableWindow(hBtnVerify,    TRUE);
-            SetWindowText(hBtnVerify, "Verify");
+            if (!params)
+            {
+                MessageBox(hwnd, "Out of memory.", "Error",
+                           MB_OK | MB_ICONERROR);
+                EnableWindow(hBtnSelectISO, TRUE);
+                EnableWindow(hBtnVerify,    TRUE);
+                SetWindowText(hBtnVerify, "Verify");
+                break;
+            }
 
-            if (!ok) break;
+            params->hwnd = hwnd;
+            strncpy(params->path, g_selectedFile, MAX_PATH - 1);
 
-            /* ── Compare against pre-approved catalogue ─────────────── */
+            HANDLE hThread = CreateThread(
+                NULL,            /* default security   */
+                0,               /* default stack size */
+                HashThreadProc,  /* entry point        */
+                params,          /* argument           */
+                0,               /* start immediately  */
+                NULL);           /* thread ID (unused) */
+
+            if (!hThread)
+            {
+                HeapFree(GetProcessHeap(), 0, params);
+                MessageBox(hwnd, "Failed to create worker thread.", "Error",
+                           MB_OK | MB_ICONERROR);
+                EnableWindow(hBtnSelectISO, TRUE);
+                EnableWindow(hBtnVerify,    TRUE);
+                SetWindowText(hBtnVerify, "Verify");
+                break;
+            }
+
+            /* We don't join the thread � WM_HASH_DONE signals completion */
+            CloseHandle(hThread);
+            break;
+        }
+        }
+        break;
+
+    /* -- Worker thread finished: process result on the UI thread ----------- */
+    case WM_HASH_DONE:
+    {
+        HashResult *result = (HashResult *)lParam;
+
+        /* Re-enable controls regardless of outcome */
+        EnableWindow(hBtnSelectISO, TRUE);
+        EnableWindow(hBtnVerify,    TRUE);
+        SetWindowText(hBtnVerify, "Verify");
+
+        if (!result)
+        {
+            /* NULL result means the worker ran out of memory */
+            MessageBox(hwnd, "Worker thread ran out of memory.", "Error",
+                       MB_OK | MB_ICONERROR);
+            break;
+        }
+
+        if (!result->success)
+        {
+            MessageBox(hwnd, result->errorMsg, "Error",
+                       MB_OK | MB_ICONERROR);
+        }
+        else
+        {
+            /* -- Compare against pre-approved catalogue ----------------- */
             const char *matchedName = NULL;
             for (int i = 0; i < g_approvedCount; i++)
             {
-                if (_stricmp(hexDigest, g_approvedISOs[i].sha256) == 0)
+                if (_stricmp(result->hexDigest,
+                             g_approvedISOs[i].sha256) == 0)
                 {
                     matchedName = g_approvedISOs[i].filename;
                     break;
@@ -286,9 +413,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                          "The checksum matches the approved image:\r\n"
                          "  %s\r\n\r\n"
                          "SHA-256:\r\n  %s",
-                         matchedName, hexDigest);
-                MessageBox(hwnd, resultMsg, "Verification Passed",
-                           MB_OK | MB_ICONINFORMATION);
+                         matchedName, result->hexDigest);
+                MessageBox(hwnd, resultMsg, "IMMIO Tool - Verification Passed",
+                           MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
             }
             else
             {
@@ -296,14 +423,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                          "Verification FAILED\r\n\r\n"
                          "The checksum does not match any approved image.\r\n\r\n"
                          "SHA-256:\r\n  %s",
-                         hexDigest);
-                MessageBox(hwnd, resultMsg, "Verification Failed",
-                           MB_OK | MB_ICONERROR);
+                         result->hexDigest);
+                MessageBox(hwnd, resultMsg, "IMMIO Tool - Verification Failed",
+                           MB_OK | MB_ICONERROR | MB_TOPMOST);
             }
-            break;
         }
-        }
+
+        /* UI thread frees the result that was allocated by the worker */
+        HeapFree(GetProcessHeap(), 0, result);
         break;
+    }
 
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -315,6 +444,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
+/* ----------------------------------------------------------------------------
+   WinMain
+   ---------------------------------------------------------------------------- */
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
