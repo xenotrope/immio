@@ -1,6 +1,6 @@
 /*
     Public domain.
-    20260327
+    20260427
 */
 
 #include <windows.h>
@@ -9,25 +9,27 @@
 
 #pragma comment(lib, "bcrypt.lib")
 
-/* -- Control IDs ---------------------------------------------------------- */
-#define ID_BTN_SELECT_ISO  101
-#define ID_BTN_VERIFY      102
+/* ── Control IDs ─────────────────────────────────────────────────────────── */
+#define ID_BTN_SELECT_ISO    101
+#define ID_BTN_VERIFY        102
+#define ID_BTN_COPY          201   /* inside result dialog */
+#define ID_BTN_OK            202   /* inside result dialog */
+#define ID_STATIC_MSG        203   /* inside result dialog */
 
-/* -- Custom window message posted by the worker thread on completion ------
+/* ── Custom window message posted by the worker thread on completion ──────
    wParam : unused (0)
-   lParam : heap-allocated HashResult* � UI thread must free it            */
+   lParam : heap-allocated HashResult* — UI thread must free it            */
 #define WM_HASH_DONE  (WM_APP + 1)
 
 #define READ_CHUNK_SIZE (1024 * 1024)   /* 1 MB read buffer */
 
-/* -- Pre-approved ISO catalogue ------------------------------------------
+/* ── Pre-approved ISO catalogue ──────────────────────────────────────────
    Each row is { sha256_hex, display_filename }.
    Hashes must be 64 lowercase hex characters.                            */
 typedef struct { const char *sha256; const char *filename; } ISOEntry;
 
 static const ISOEntry g_approvedISOs[] =
-{
-    { "f1e0469b220b318151bf5c9515380705ddc5d4f59dd0f1af6e78fea599f05e4a", "linuxmint-19.3-cinnamon-32bit.iso" },
+{    { "f1e0469b220b318151bf5c9515380705ddc5d4f59dd0f1af6e78fea599f05e4a", "linuxmint-19.3-cinnamon-32bit.iso" },
     { "7a9e54212433c8547edfd789ac933c91a9bde1a61196fa7977c5357a2c40292d", "linuxmint-19.3-cinnamon-64bit.iso" },
     { "9d302939a07205383231c2e41f3712b2cea7f1bff0470eed2d16f6c6ef0abc0a", "linuxmint-19.3-mate-32bit.iso" },
     { "610385bd480d4f906774d865761c429bccc522cf9dd62a5928045fac8fa24bf6", "linuxmint-19.3-mate-64bit.iso" },
@@ -87,26 +89,26 @@ static const ISOEntry g_approvedISOs[] =
     { "7609294da613b75eea89bb918292125e9f06418a368136fb190466e15bf8c373", "linuxmint-22.3-mate-64bit.iso" },
     { "45a835b5dddaf40e84d776549e0b19b3fbd49673b6cc6434ebddbfcd217df776", "linuxmint-22.3-xfce-64bit.iso" },
 
-    { "e7583d7428a36b54986d4bf29ebcc000f6959ee701c2379ca214fac6b32fe479", "lmde-4-cinnamon-32bit.iso"},
-    { "fb6fb4f507f1de979a8922f9e503ae0ad8109e87ea1a9a163a6b30f819971256", "lmde-4-cinnamon-64bit.iso"},
-    { "1116d611be80ad496bdc5a7c0444f63564539891f2176f9b134ff9630c6b91c8", "lmde-5-cinnamon-32bit.iso"},
-    { "8f351d30e97f3a9c3f3848fde781c7f3758abd0f8ddf120827d98a5832cfa027", "lmde-5-cinnamon-64bit.iso"},
-    { "40a9988cc6edd253bff9fcab422aec1b2c81ab3aa4d34b91b08277592c5fab28", "lmde-6-cinnamon-32bit.iso"},
-    { "96963cac1ac2ad4ba38414e618adbcdf64a6faadc33ddf53889fa3dc74d59df4", "lmde-6-cinnamon-64bit.iso"},
-    { "520b9de3e06871d69292f0e82a5979b62088ad83fdf4dce1d19100118a7033e4", "lmde-7-cinnamon-64bit.iso"},
+    { "e7583d7428a36b54986d4bf29ebcc000f6959ee701c2379ca214fac6b32fe479", "lmde-4-cinnamon-32bit.iso" },
+    { "fb6fb4f507f1de979a8922f9e503ae0ad8109e87ea1a9a163a6b30f819971256", "lmde-4-cinnamon-64bit.iso" },
+    { "1116d611be80ad496bdc5a7c0444f63564539891f2176f9b134ff9630c6b91c8", "lmde-5-cinnamon-32bit.iso" },
+    { "8f351d30e97f3a9c3f3848fde781c7f3758abd0f8ddf120827d98a5832cfa027", "lmde-5-cinnamon-64bit.iso" },
+    { "40a9988cc6edd253bff9fcab422aec1b2c81ab3aa4d34b91b08277592c5fab28", "lmde-6-cinnamon-32bit.iso" },
+    { "96963cac1ac2ad4ba38414e618adbcdf64a6faadc33ddf53889fa3dc74d59df4", "lmde-6-cinnamon-64bit.iso" },
+    { "520b9de3e06871d69292f0e82a5979b62088ad83fdf4dce1d19100118a7033e4", "lmde-7-cinnamon-64bit.iso" },
 };
 
 static const int g_approvedCount =
     (int)(sizeof(g_approvedISOs) / sizeof(g_approvedISOs[0]));
 
-/* -- Data passed TO the worker thread (heap-allocated, thread frees it) -- */
+/* ── Data passed TO the worker thread (heap-allocated, thread frees it) ── */
 typedef struct
 {
     HWND hwnd;
     char path[MAX_PATH];
 } HashThreadParams;
 
-/* -- Result posted BACK to the UI thread (heap-allocated, UI frees it) --- */
+/* ── Result posted BACK to the UI thread (heap-allocated, UI frees it) ─── */
 typedef struct
 {
     BOOL success;
@@ -114,16 +116,191 @@ typedef struct
     char errorMsg[256];   /* set on failure       */
 } HashResult;
 
-/* -- Global UI handles ----------------------------------------------------- */
+/* ── Global UI handles ───────────────────────────────────────────────────── */
 static HWND hBtnSelectISO;
 static HWND hBtnVerify;
 static char g_selectedFile[MAX_PATH] = {0};
 
-/* ----------------------------------------------------------------------------
+/* ════════════════════════════════════════════════════════════════════════════
+   ResultDlgProc  —  window procedure for the custom result dialog.
+   GWLP_USERDATA holds a const char* to the message text (owned by caller).
+   ════════════════════════════════════════════════════════════════════════════ */
+static LRESULT CALLBACK ResultDlgProc(HWND hwnd, UINT msg,
+                                       WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        LPCREATESTRUCT cs  = (LPCREATESTRUCT)lParam;
+        const char *text   = (const char *)cs->lpCreateParams;
+        SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)text);
+
+        /* Message display — read-only multiline edit, fixed-pitch font so
+           the 64-char SHA-256 digest always fits on one line.            */
+        HWND hEdit = CreateWindowEx(
+            0, "EDIT", text,
+            WS_VISIBLE | WS_CHILD | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+            12, 12, 536, 110,
+            hwnd, (HMENU)ID_STATIC_MSG, cs->hInstance, NULL);
+
+        /* SYSTEM_FIXED_FONT is a stock monospaced font — no allocation needed */
+        SendMessage(hEdit, WM_SETFONT,
+                    (WPARAM)GetStockObject(SYSTEM_FIXED_FONT), TRUE);
+
+        /* "Copy to Clipboard" button */
+        CreateWindow(
+            "BUTTON", "Copy to Clipboard",
+            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            12, 134, 150, 28,
+            hwnd, (HMENU)ID_BTN_COPY, cs->hInstance, NULL);
+
+        /* "OK" button — right-aligned inside the 560px client width */
+        CreateWindow(
+            "BUTTON", "OK",
+            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+            436, 134, 112, 28,
+            hwnd, (HMENU)ID_BTN_OK, cs->hInstance, NULL);
+
+        break;
+    }
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam))
+        {
+        case ID_BTN_COPY:
+        {
+            const char *text = (const char *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+            SIZE_T len = strlen(text) + 1;
+
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+            if (hMem)
+            {
+                void *ptr = GlobalLock(hMem);
+                if (ptr)
+                {
+                    memcpy(ptr, text, len);
+                    GlobalUnlock(hMem);
+                    if (OpenClipboard(hwnd))
+                    {
+                        EmptyClipboard();
+                        SetClipboardData(CF_TEXT, hMem);
+                        CloseClipboard();
+                        /* hMem now owned by the clipboard — do not free */
+                    }
+                    else
+                    {
+                        GlobalFree(hMem);
+                    }
+                }
+                else
+                {
+                    GlobalFree(hMem);
+                }
+            }
+            break;
+        }
+
+        case ID_BTN_OK:
+            /* Signal the modal loop to exit */
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
+            break;
+        }
+        break;
+
+    /* Allow closing via Alt-F4 / the title-bar X */
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+
+    default:
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   ShowResultDialog
+   Creates a modal result window with a message area, a "Copy to Clipboard"
+   button, and an "OK" button.  Blocks until the user dismisses the dialog.
+   ════════════════════════════════════════════════════════════════════════════ */
+static void ShowResultDialog(HWND hwndParent, HINSTANCE hInst,
+                              const char *title, const char *message,
+                              BOOL topmost)
+{
+    static const char DLG_CLASS[] = "ISOToolResultDialog";
+
+    /* Register the dialog window class (idempotent — fails silently if
+       already registered, which is fine)                                 */
+    WNDCLASS wc      = {0};
+    wc.lpfnWndProc   = ResultDlgProc;
+    wc.hInstance     = hInst;
+    wc.lpszClassName = DLG_CLASS;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    RegisterClass(&wc);   /* return value intentionally ignored */
+
+    DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW;
+    if (topmost) exStyle |= WS_EX_TOPMOST;
+
+    /* Fixed size: 450 wide × 180 tall (client area).  AdjustWindowRectEx
+       expands that to account for caption + border.                      */
+    /* 560px wide gives the 64-char SHA-256 line comfortable room at the
+       fixed-pitch font used by the edit control.                         */
+    RECT rc = { 0, 0, 560, 180 };
+    AdjustWindowRectEx(&rc, WS_CAPTION | WS_SYSMENU, FALSE, exStyle);
+    int w = rc.right  - rc.left;
+    int h = rc.bottom - rc.top;
+
+    /* Centre on the screen */
+    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+    int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+
+    HWND hDlg = CreateWindowEx(
+        exStyle,
+        DLG_CLASS, title,
+        WS_CAPTION | WS_SYSMENU,
+        x, y, w, h,
+        hwndParent,
+        NULL, hInst,
+        (LPVOID)message);   /* passed to WM_CREATE as lpCreateParams */
+
+    if (!hDlg) return;
+
+    /* Make modal: disable the parent while the dialog is open */
+    EnableWindow(hwndParent, FALSE);
+
+    ShowWindow(hDlg, SW_SHOW);
+    UpdateWindow(hDlg);
+
+    /* Nested message loop — runs until DestroyWindow → PostQuitMessage */
+    MSG m = {0};
+    while (GetMessage(&m, NULL, 0, 0))
+    {
+        /* Forward Enter/Escape to the dialog */
+        if (m.message == WM_KEYDOWN)
+        {
+            if (m.wParam == VK_RETURN || m.wParam == VK_ESCAPE)
+                PostMessage(hDlg, WM_CLOSE, 0, 0);
+        }
+        TranslateMessage(&m);
+        DispatchMessage(&m);
+    }
+
+    /* Re-enable and restore focus to the parent */
+    EnableWindow(hwndParent, TRUE);
+    SetForegroundWindow(hwndParent);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
    ComputeSHA256
-   Pure computation � no UI calls.  Fills outHex (>=65 bytes) on success.
+   Pure computation — no UI calls.  Fills outHex (>=65 bytes) on success.
    Fills errorMsg (>=256 bytes) and returns FALSE on any failure.
-   ---------------------------------------------------------------------------- */
+   ════════════════════════════════════════════════════════════════════════════ */
 static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
 {
     BOOL success = FALSE;
@@ -136,7 +313,6 @@ static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
     DWORD  cbHashObject = 0, cbHash = 0, cbData = 0;
     HANDLE hFile        = INVALID_HANDLE_VALUE;
 
-    /* -- Open the CNG SHA-256 provider ------------------------------------ */
     if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
             &hAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
     {
@@ -144,7 +320,6 @@ static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
         goto cleanup;
     }
 
-    /* -- Size and allocate the internal hash object ----------------------- */
     if (!BCRYPT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
             (PBYTE)&cbHashObject, sizeof(DWORD), &cbData, 0)))
     {
@@ -155,7 +330,6 @@ static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
     pbHashObject = (PBYTE)HeapAlloc(GetProcessHeap(), 0, cbHashObject);
     if (!pbHashObject) { strncpy(errorMsg, "Out of memory.", 255); goto cleanup; }
 
-    /* -- Size and allocate the output digest buffer ----------------------- */
     if (!BCRYPT_SUCCESS(BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH,
             (PBYTE)&cbHash, sizeof(DWORD), &cbData, 0)))
     {
@@ -166,7 +340,6 @@ static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
     pbHash = (PBYTE)HeapAlloc(GetProcessHeap(), 0, cbHash);
     if (!pbHash) { strncpy(errorMsg, "Out of memory.", 255); goto cleanup; }
 
-    /* -- Create the hash state --------------------------------------------- */
     if (!BCRYPT_SUCCESS(BCryptCreateHash(
             hAlg, &hHash, pbHashObject, cbHashObject, NULL, 0, 0)))
     {
@@ -174,7 +347,6 @@ static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
         goto cleanup;
     }
 
-    /* -- Open the file ----------------------------------------------------- */
     hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                         OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (hFile == INVALID_HANDLE_VALUE)
@@ -183,7 +355,6 @@ static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
         goto cleanup;
     }
 
-    /* -- Feed file data to the hash in 1 MB chunks ------------------------ */
     pbBuffer = (PBYTE)HeapAlloc(GetProcessHeap(), 0, READ_CHUNK_SIZE);
     if (!pbBuffer) { strncpy(errorMsg, "Out of memory.", 255); goto cleanup; }
 
@@ -195,7 +366,7 @@ static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
             strncpy(errorMsg, "Error reading file during hashing.", 255);
             goto cleanup;
         }
-        if (dwRead == 0) break;  /* EOF */
+        if (dwRead == 0) break;
 
         if (!BCRYPT_SUCCESS(BCryptHashData(hHash, pbBuffer, dwRead, 0)))
         {
@@ -204,14 +375,12 @@ static BOOL ComputeSHA256(const char *path, char *outHex, char *errorMsg)
         }
     }
 
-    /* -- Finalise the digest ----------------------------------------------- */
     if (!BCRYPT_SUCCESS(BCryptFinishHash(hHash, pbHash, cbHash, 0)))
     {
         strncpy(errorMsg, "BCryptFinishHash failed.", 255);
         goto cleanup;
     }
 
-    /* -- Convert raw bytes to lowercase hex ------------------------------- */
     for (DWORD i = 0; i < cbHash; i++)
         sprintf(outHex + i * 2, "%02x", pbHash[i]);
     outHex[cbHash * 2] = '\0';
@@ -229,11 +398,9 @@ cleanup:
     return success;
 }
 
-/* ----------------------------------------------------------------------------
-   HashThreadProc  �  worker thread entry point
-   Runs entirely off the UI thread.  Allocates a HashResult on the heap,
-   fills it, then hands ownership to the UI thread via PostMessage.
-   ---------------------------------------------------------------------------- */
+/* ════════════════════════════════════════════════════════════════════════════
+   HashThreadProc  —  worker thread entry point
+   ════════════════════════════════════════════════════════════════════════════ */
 static DWORD WINAPI HashThreadProc(LPVOID lpParam)
 {
     HashThreadParams *params = (HashThreadParams *)lpParam;
@@ -243,7 +410,6 @@ static DWORD WINAPI HashThreadProc(LPVOID lpParam)
 
     if (!result)
     {
-        /* Catastrophic allocation failure � re-enable the UI at minimum */
         PostMessage(params->hwnd, WM_HASH_DONE, 0, (LPARAM)NULL);
         HeapFree(GetProcessHeap(), 0, params);
         return 1;
@@ -253,21 +419,19 @@ static DWORD WINAPI HashThreadProc(LPVOID lpParam)
                                     result->hexDigest,
                                     result->errorMsg);
 
-    /* Transfer ownership of `result` to the UI thread */
     PostMessage(params->hwnd, WM_HASH_DONE, 0, (LPARAM)result);
 
     HeapFree(GetProcessHeap(), 0, params);
     return 0;
 }
 
-/* ----------------------------------------------------------------------------
-   WndProc  �  runs exclusively on the UI thread
-   ---------------------------------------------------------------------------- */
+/* ════════════════════════════════════════════════════════════════════════════
+   WndProc  —  runs exclusively on the UI thread
+   ════════════════════════════════════════════════════════════════════════════ */
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
-    /* -- Create child controls -------------------------------------------- */
     case WM_CREATE:
         hBtnSelectISO = CreateWindow(
             "BUTTON", "Select ISO",
@@ -278,13 +442,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         hBtnVerify = CreateWindow(
             "BUTTON", "Verify",
-            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,  /* no WS_DISABLED — see below */
             160, 20, 120, 30,
             hwnd, (HMENU)ID_BTN_VERIFY,
             ((LPCREATESTRUCT)lParam)->hInstance, NULL);
+
+        /* Feature 1: grey out Verify until a file is chosen */
+        EnableWindow(hBtnVerify, FALSE);
         break;
 
-    /* -- Button clicks ---------------------------------------------------- */
     case WM_COMMAND:
         switch (LOWORD(wParam))
         {
@@ -305,12 +471,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (GetOpenFileName(&ofn))
             {
                 strncpy(g_selectedFile, szFile, MAX_PATH - 1);
+                // MessageBox(hwnd, g_selectedFile, "Selected ISO",
+                           // MB_OK | MB_ICONINFORMATION);
+
+                /* Feature 1: enable Verify now that a file is selected */
+                EnableWindow(hBtnVerify, TRUE);
             }
             break;
         }
 
         case ID_BTN_VERIFY:
         {
+            /* Guard is still here as a safety net, but the button will
+               be disabled before a file is selected anyway.             */
             if (g_selectedFile[0] == '\0')
             {
                 MessageBox(hwnd,
@@ -320,12 +493,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 break;
             }
 
-            /* Disable controls immediately � re-enabled in WM_HASH_DONE */
             EnableWindow(hBtnSelectISO, FALSE);
             EnableWindow(hBtnVerify,    FALSE);
             SetWindowText(hBtnVerify, "Working...");
 
-            /* Heap-allocate params � HashThreadProc frees them */
             HashThreadParams *params = (HashThreadParams *)HeapAlloc(
                 GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(HashThreadParams));
 
@@ -343,12 +514,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             strncpy(params->path, g_selectedFile, MAX_PATH - 1);
 
             HANDLE hThread = CreateThread(
-                NULL,            /* default security   */
-                0,               /* default stack size */
-                HashThreadProc,  /* entry point        */
-                params,          /* argument           */
-                0,               /* start immediately  */
-                NULL);           /* thread ID (unused) */
+                NULL, 0, HashThreadProc, params, 0, NULL);
 
             if (!hThread)
             {
@@ -361,39 +527,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 break;
             }
 
-            /* We don't join the thread � WM_HASH_DONE signals completion */
             CloseHandle(hThread);
             break;
         }
         }
         break;
 
-    /* -- Worker thread finished: process result on the UI thread ----------- */
+    /* ── Worker thread finished ─────────────────────────────────────────── */
     case WM_HASH_DONE:
     {
         HashResult *result = (HashResult *)lParam;
 
-        /* Re-enable controls regardless of outcome */
         EnableWindow(hBtnSelectISO, TRUE);
         EnableWindow(hBtnVerify,    TRUE);
         SetWindowText(hBtnVerify, "Verify");
 
         if (!result)
         {
-            /* NULL result means the worker ran out of memory */
             MessageBox(hwnd, "Worker thread ran out of memory.", "Error",
-                       MB_OK | MB_ICONERROR);
+                       MB_OK | MB_ICONERROR | MB_TOPMOST);
             break;
         }
 
         if (!result->success)
         {
             MessageBox(hwnd, result->errorMsg, "Error",
-                       MB_OK | MB_ICONERROR);
+                       MB_OK | MB_ICONERROR | MB_TOPMOST);
         }
         else
         {
-            /* -- Compare against pre-approved catalogue ----------------- */
+            /* Retrieve the HINSTANCE stored during WM_CREATE */
+            HINSTANCE hInst = (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE);
+
             const char *matchedName = NULL;
             for (int i = 0; i < g_approvedCount; i++)
             {
@@ -414,8 +579,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                          "  %s\r\n\r\n"
                          "SHA-256:\r\n  %s",
                          matchedName, result->hexDigest);
-                MessageBox(hwnd, resultMsg, "IMMIO Tool - Verification Passed",
-                           MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+                ShowResultDialog(hwnd, hInst,
+                                 "Verification Passed", resultMsg, TRUE);
             }
             else
             {
@@ -424,12 +589,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                          "The checksum does not match any approved image.\r\n\r\n"
                          "SHA-256:\r\n  %s",
                          result->hexDigest);
-                MessageBox(hwnd, resultMsg, "IMMIO Tool - Verification Failed",
-                           MB_OK | MB_ICONERROR | MB_TOPMOST);
+                ShowResultDialog(hwnd, hInst,
+                                 "Verification Failed", resultMsg, TRUE);
             }
         }
 
-        /* UI thread frees the result that was allocated by the worker */
         HeapFree(GetProcessHeap(), 0, result);
         break;
     }
@@ -444,13 +608,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return 0;
 }
 
-/* ----------------------------------------------------------------------------
+/* ════════════════════════════════════════════════════════════════════════════
    WinMain
-   ---------------------------------------------------------------------------- */
+   ════════════════════════════════════════════════════════════════════════════ */
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
 {
-    const char CLASS_NAME[] = "IMMIOToolWindow";
+    const char CLASS_NAME[] = "ISOToolWindow";
 
     WNDCLASS wc      = {0};
     wc.lpfnWndProc   = WndProc;
@@ -462,7 +626,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     RegisterClass(&wc);
 
     HWND hwnd = CreateWindow(
-        CLASS_NAME, "IMMIO Tool",
+        CLASS_NAME, "ISO Tool",
         WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
         320, 100,
