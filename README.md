@@ -38,7 +38,7 @@ Linux Minut Debian Edition versions are also supported as far back as version 4.
 If you want to build IMMIO yourself, you will need to install [Build Tools for Visual Studio 2026](https://aka.ms/vs/stable/vs_BuildTools.exe) or newer on Windows and then run the following:
 
 ```
-cl immio.cpp /link user32.lib comdlg32.lib
+cl immio.cpp /link user32.lib comdlg32.lib gdi32.lib
 ```
 
 ## And now a warning
